@@ -1,24 +1,26 @@
 """Web search tool used by the Researcher agent.
 
-Step 2: real implementation.
-  1. `_search_duckduckgo`  -> get a handful of candidate result URLs
-  2. `_fetch_page_text`    -> download each page and strip it to plain text
-  3. `search_web`          -> the public function the agent calls; combines
-                              the two above and returns findings + sources
-
-No API key is required anywhere in this file.
+Step 2 (updated): real search + fetch, now with retry logic.
+DuckDuckGo's free search sometimes rate-limits automated requests, so
+`_search_duckduckgo` retries a few times with an increasing wait
+between attempts before giving up.
 """
 import logging
+import time
 
 import httpx
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
+from duckduckgo_search.exceptions import RatelimitException
 
 logger = logging.getLogger(__name__)
 
 MAX_RESULTS = 3          # how many search results to fetch per sub-question
 FETCH_TIMEOUT = 10.0      # seconds, per page fetch
 MAX_CHARS_PER_PAGE = 3000  # truncate long pages so we don't blow up the LLM prompt
+
+MAX_SEARCH_RETRIES = 3    # how many times to retry a rate-limited search
+RETRY_BASE_DELAY = 5      # seconds; doubles each retry (5s, 10s, 20s)
 
 # Some sites reject requests with no User-Agent header, so we set one that
 # looks like an ordinary browser.
@@ -34,22 +36,41 @@ HEADERS = {
 def _search_duckduckgo(query: str, max_results: int = MAX_RESULTS) -> list[dict]:
     """Return a list of {"title": str, "url": str} search results.
 
-    Uses the duckduckgo-search library, which scrapes DuckDuckGo's public
-    search results — no API key, no account needed.
+    Retries on RatelimitException with an increasing delay, since
+    DuckDuckGo's free scraping API sometimes throttles rapid requests.
     """
-    results = []
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                # duckduckgo-search returns dicts with "title", "href", "body"
-                url = r.get("href")
-                title = r.get("title", "")
-                if url:
-                    results.append({"title": title, "url": url})
-    except Exception as exc:  # noqa: BLE001 - log and continue, don't crash the graph
-        logger.warning("DuckDuckGo search failed for %r: %s", query, exc)
+    delay = RETRY_BASE_DELAY
 
-    return results
+    for attempt in range(1, MAX_SEARCH_RETRIES + 1):
+        try:
+            results = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_results):
+                    url = r.get("href")
+                    title = r.get("title", "")
+                    if url:
+                        results.append({"title": title, "url": url})
+            return results
+
+        except RatelimitException:
+            if attempt == MAX_SEARCH_RETRIES:
+                logger.warning(
+                    "DuckDuckGo rate-limited us %d times for %r, giving up.",
+                    attempt, query,
+                )
+                return []
+            logger.info(
+                "Rate-limited on attempt %d for %r, waiting %ds before retry...",
+                attempt, query, delay,
+            )
+            time.sleep(delay)
+            delay *= 2  # exponential backoff: 5s, 10s, 20s
+
+        except Exception as exc:  # noqa: BLE001 - log and give up, don't crash the graph
+            logger.warning("DuckDuckGo search failed for %r: %s", query, exc)
+            return []
+
+    return []
 
 
 def _fetch_page_text(url: str) -> str:
