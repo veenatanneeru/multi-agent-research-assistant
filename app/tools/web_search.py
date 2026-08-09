@@ -1,114 +1,51 @@
 """Web search tool used by the Researcher agent.
 
-Step 2 (updated): real search + fetch, now with retry logic.
-DuckDuckGo's free search sometimes rate-limits automated requests, so
-`_search_duckduckgo` retries a few times with an increasing wait
-between attempts before giving up.
+Step 2 (final): uses Tavily's search API instead of scraping
+DuckDuckGo. Tavily is built for AI agents, returns clean already-
+summarized content per result, and is far more reliable than free
+scraping. Requires TAVILY_API_KEY in .env.
 """
 import logging
-import time
 
-import httpx
-from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
-from duckduckgo_search.exceptions import RatelimitException
+from tavily import TavilyClient
+
+from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-MAX_RESULTS = 3          # how many search results to fetch per sub-question
-FETCH_TIMEOUT = 10.0      # seconds, per page fetch
-MAX_CHARS_PER_PAGE = 3000  # truncate long pages so we don't blow up the LLM prompt
-
-MAX_SEARCH_RETRIES = 3    # how many times to retry a rate-limited search
-RETRY_BASE_DELAY = 5      # seconds; doubles each retry (5s, 10s, 20s)
-
-# Some sites reject requests with no User-Agent header, so we set one that
-# looks like an ordinary browser.
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-
-
-def _search_duckduckgo(query: str, max_results: int = MAX_RESULTS) -> list[dict]:
-    """Return a list of {"title": str, "url": str} search results.
-
-    Retries on RatelimitException with an increasing delay, since
-    DuckDuckGo's free scraping API sometimes throttles rapid requests.
-    """
-    delay = RETRY_BASE_DELAY
-
-    for attempt in range(1, MAX_SEARCH_RETRIES + 1):
-        try:
-            results = []
-            with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=max_results):
-                    url = r.get("href")
-                    title = r.get("title", "")
-                    if url:
-                        results.append({"title": title, "url": url})
-            return results
-
-        except RatelimitException:
-            if attempt == MAX_SEARCH_RETRIES:
-                logger.warning(
-                    "DuckDuckGo rate-limited us %d times for %r, giving up.",
-                    attempt, query,
-                )
-                return []
-            logger.info(
-                "Rate-limited on attempt %d for %r, waiting %ds before retry...",
-                attempt, query, delay,
-            )
-            time.sleep(delay)
-            delay *= 2  # exponential backoff: 5s, 10s, 20s
-
-        except Exception as exc:  # noqa: BLE001 - log and give up, don't crash the graph
-            logger.warning("DuckDuckGo search failed for %r: %s", query, exc)
-            return []
-
-    return []
-
-
-def _fetch_page_text(url: str) -> str:
-    """Download a page and return its main readable text, truncated.
-
-    Returns an empty string if the fetch or parse fails for any reason
-    (dead link, timeout, non-HTML content, etc.) — callers should treat
-    an empty string as "skip this source" rather than crash.
-    """
-    try:
-        response = httpx.get(
-            url, headers=HEADERS, timeout=FETCH_TIMEOUT, follow_redirects=True
-        )
-        response.raise_for_status()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to fetch %s: %s", url, exc)
-        return ""
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    # Strip elements that are never useful content: scripts, styles, nav,
-    # headers/footers, and ads typically live in these tags.
-    for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
-        tag.decompose()
-
-    text = soup.get_text(separator=" ", strip=True)
-    return text[:MAX_CHARS_PER_PAGE]
+MAX_RESULTS = 3  # how many search results to fetch per sub-question
 
 
 def search_web(query: str) -> dict:
-    """Search the web for `query` and return combined findings + sources.
+    """Search the web for `query` using Tavily and return findings + sources.
 
     This is the function the Researcher agent (app/agents/researcher.py)
-    calls for each sub-question. It never raises — on total failure it
-    returns an empty summary so the graph can still complete and the
-    Summarizer can report "no findings" honestly.
+    calls for each sub-question. It never raises — on failure it returns
+    an empty summary so the graph can still complete and the Summarizer
+    can report "no findings" honestly.
     """
-    results = _search_duckduckgo(query)
+    if not settings.tavily_api_key:
+        logger.warning("TAVILY_API_KEY is not set; skipping search.")
+        return {
+            "summary": "No search performed: TAVILY_API_KEY is not configured.",
+            "sources": [],
+        }
+
+    try:
+        client = TavilyClient(api_key=settings.tavily_api_key)
+        response = client.search(
+            query=query,
+            max_results=MAX_RESULTS,
+            include_answer=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - log and give up, don't crash the graph
+        logger.warning("Tavily search failed for %r: %s", query, exc)
+        return {
+            "summary": f"Search failed for '{query}': {exc}",
+            "sources": [],
+        }
+
+    results = response.get("results", [])
 
     if not results:
         return {
@@ -120,17 +57,20 @@ def search_web(query: str) -> dict:
     sources = []
 
     for result in results:
-        page_text = _fetch_page_text(result["url"])
-        if not page_text:
-            continue  # skip sources we couldn't fetch, don't fail the whole search
+        title = result.get("title", "")
+        content = result.get("content", "")
+        url = result.get("url", "")
 
-        findings_parts.append(f"Source: {result['title']}\n{page_text}")
-        sources.append(result["url"])
+        if not content:
+            continue
+
+        findings_parts.append(f"Source: {title}\n{content}")
+        sources.append(url)
 
     if not findings_parts:
         return {
             "summary": f"Found {len(results)} result(s) for '{query}' but "
-            f"could not fetch content from any of them.",
+            f"none had usable content.",
             "sources": [],
         }
 
